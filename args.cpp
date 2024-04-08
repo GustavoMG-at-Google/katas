@@ -25,92 +25,107 @@ struct Flags {
   FlagOfType<int32_t> int32_flags;
 };
 
-std::optional<FlagName> parse_flag_name(const std::string& token) {
-  if (token.size() <= 1) {
+class TokenIterator {
+ public:
+  TokenIterator(const std::string& arg_list) : token_stream(arg_list) {}
+  std::optional<std::string> next() {
+    std::string token;
+    if (token_stream >> token) {
+      return token;
+    }
     return std::nullopt;
   }
-  if (token[0] != '-') {
+
+ private:
+  std::stringstream token_stream;
+};
+
+std::optional<bool> read_bool(TokenIterator*) { return true; }
+std::optional<int32_t> read_int32(TokenIterator* it) {
+  std::optional<std::string> token = it->next();
+  if (!token.has_value()) {
     return std::nullopt;
   }
-  return token.substr(1);
-}
-
-std::optional<std::string> parse_value_as_string(const std::string& token) {
-  return token;
-}
-
-std::optional<int32_t> parse_value_as_int(const std::string& token) {
   try {
-    return std::stoi(token);
+    return std::stoi(*token);
   } catch (...) {
     return std::nullopt;
   }
 }
+std::optional<std::string> read_string(TokenIterator* it) { return it->next(); }
 
-struct FlagState {};
-struct ValueState {
+struct ParseError {};
+struct ReadName {};
+struct ReadValue {
   FlagName flag_name;
-  FlagType flag_type;
 };
-using State = std::variant<FlagState, ValueState>;
+struct Done {};
+using State = std::variant<ParseError, ReadName, ReadValue, Done>;
 class StateMachine {
  public:
-  StateMachine(const FlagSchema& schema, const std::string& token, Flags* flags)
-      : schema_(schema), token_(token), flags_(flags) {}
-  std::optional<State> operator()(const FlagState&) {
-    std::optional<FlagName> flag_name = parse_flag_name(token_);
-    if (!flag_name.has_value()) {
-      return std::nullopt;
+  StateMachine(const FlagSchema& schema, TokenIterator* it, Flags* flags)
+      : schema_(schema), it_(it), flags_(flags) {}
+  State operator()(const ReadName&) {
+    std::optional<std::string> name = it_->next();
+    if (!name.has_value()) {
+      return Done{};
     }
-    auto schema_it = schema_.find(*flag_name);
+    if (name->size() <= 1) {
+      return ParseError{};
+    }
+    if (name->at(0) != '-') {
+      return ParseError{};
+    }
+    return ReadValue{.flag_name = name->substr(1)};
+  }
+  State operator()(const ReadValue& state) {
+    auto schema_it = schema_.find(state.flag_name);
     if (schema_it == schema_.end()) {
-      return std::nullopt;
+      return ParseError{};
     }
     FlagType type = schema_it->second;
     if (type == BOOL) {
-      flags_->bool_flags[*flag_name] = true;
-      return FlagState{};
-    }
-    return ValueState{*flag_name, type};
-  }
-  std::optional<State> operator()(const ValueState& state) {
-    if (state.flag_type == INT32) {
-      std::optional<int32_t> value = parse_value_as_int(token_);
+      std::optional<bool> value = read_bool(it_);
       if (!value.has_value()) {
-        return std::nullopt;
+        return ParseError{};
+      }
+      flags_->bool_flags[state.flag_name] = *value;
+    } else if (type == INT32) {
+      std::optional<int32_t> value = read_int32(it_);
+      if (!value.has_value()) {
+        return ParseError{};
       }
       flags_->int32_flags[state.flag_name] = *value;
-    } else {
-      std::optional<std::string> value = parse_value_as_string(token_);
+    } else if (type == STRING) {
+      std::optional<std::string> value = read_string(it_);
       if (!value.has_value()) {
-        return std::nullopt;
+        return ParseError{};
       }
       flags_->string_flags[state.flag_name] = *value;
     }
-    return FlagState{};
+    return ReadName{};
   }
+  State operator()(const ParseError& error) { return error; }
+  State operator()(const Done& done) { return done; }
 
  private:
   const FlagSchema& schema_;
-  const std::string& token_;
+  TokenIterator* it_;
   Flags* flags_;
 };
 
 std::optional<Flags> parse_arg_list(const FlagSchema& schema,
                                     const std::string& arg_list) {
-  std::stringstream ss(arg_list);
-  std::string token;
+  TokenIterator it(arg_list);
   Flags flags(schema);
-  StateMachine machine(schema, token, &flags);
-  State state = FlagState{};
-  while (ss >> token) {
-    std::optional<State> next_state = std::visit(machine, state);
-    if (!next_state.has_value()) {
-      return std::nullopt;
-    }
-    state = *next_state;
+  StateMachine machine(schema, &it, &flags);
+  State state = ReadName{};
+
+  while (!std::holds_alternative<Done>(state) &&
+         !std::holds_alternative<ParseError>(state)) {
+    state = std::visit(machine, state);
   }
-  if (std::holds_alternative<ValueState>(state)) {
+  if (std::holds_alternative<ParseError>(state)) {
     return std::nullopt;
   }
   return flags;
