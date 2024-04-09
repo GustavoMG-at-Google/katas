@@ -78,63 +78,39 @@ class StringFlag : public AbstractFlag {
 using FlagName = std::string;
 using FlagRegistry = std::unordered_map<FlagName, AbstractFlag*>;
 
-struct ParseError {};
-struct ReadName {};
-struct ReadValue {
-  FlagName flag_name;
-};
-struct Done {};
-using State = std::variant<ParseError, ReadName, ReadValue, Done>;
-class StateMachine {
- public:
-  StateMachine(const FlagRegistry& registry, TokenIterator* it)
-      : registry_(registry), it_(it) {}
-  State operator()(const ReadName&) {
-    std::optional<std::string> name = it_->next();
-    if (!name.has_value()) {
-      return Done{};
-    }
-    if (name->size() <= 1) {
-      return ParseError{};
-    }
-    if (name->at(0) != '-') {
-      return ParseError{};
-    }
-    return ReadValue{.flag_name = name->substr(1)};
+enum State { DONE, PARSE_ERROR, READ_FLAG };
+State read_flag(const FlagRegistry& registry, TokenIterator* it) {
+  std::optional<std::string> name_token = it->next();
+  if (!name_token.has_value()) {
+    return DONE;
   }
-  State operator()(const ReadValue& state) {
-    auto registry_it = registry_.find(state.flag_name);
-    if (registry_it == registry_.end()) {
-      return ParseError{};
-    }
-    AbstractFlag* flag = registry_it->second;
-    bool success = flag->setValue(it_);
-    if (!success) {
-      return ParseError{};
-    }
-    return ReadName{};
+  if (name_token->size() <= 1) {
+    return PARSE_ERROR;
   }
-  State operator()(const ParseError& error) { return error; }
-  State operator()(const Done& done) { return done; }
-
- private:
-  const FlagRegistry& registry_;
-  TokenIterator* it_;
-};
+  if (name_token->at(0) != '-') {
+    return PARSE_ERROR;
+  }
+  std::string name = name_token->substr(1);
+  auto registry_it = registry.find(name);
+  if (registry_it == registry.end()) {
+    return PARSE_ERROR;
+  }
+  AbstractFlag* flag = registry_it->second;
+  bool success = flag->setValue(it);
+  if (!success) {
+    return PARSE_ERROR;
+  }
+  return READ_FLAG;
+}
 
 bool parse_arg_list(const FlagRegistry& registry, const std::string& arg_list) {
   TokenIterator it(arg_list);
-  StateMachine machine(registry, &it);
-  State state = ReadName{};
+  State state = READ_FLAG;
 
-  while (!std::holds_alternative<Done>(state) &&
-         !std::holds_alternative<ParseError>(state)) {
-    state = std::visit(machine, state);
+  while (state == READ_FLAG) {
+    state = read_flag(registry, &it);
   }
-  if (std::holds_alternative<ParseError>(state)) {
-    return false;
-  }
-  return true;
+  return state == DONE;
 }
 
 void test_happy() {
