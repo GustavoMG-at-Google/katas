@@ -6,31 +6,16 @@
 #include <unordered_map>
 #include <variant>
 
-class TokenIterator {
- public:
-  TokenIterator(const std::string& arg_list) : token_stream(arg_list) {}
-  std::optional<std::string> next() {
-    std::string token;
-    if (token_stream >> token) {
-      return token;
-    }
-    return std::nullopt;
-  }
-
- private:
-  std::stringstream token_stream;
-};
-
 class AbstractFlag {
  public:
   virtual ~AbstractFlag() = default;
-  virtual bool setValue(TokenIterator*) = 0;
+  virtual bool setValue(std::stringstream&) = 0;
 };
 
 class BoolFlag : public AbstractFlag {
  public:
   bool getValue() { return value_; }
-  bool setValue(TokenIterator* it) override {
+  bool setValue(std::stringstream&) override {
     value_ = true;
     return true;
   }
@@ -42,17 +27,9 @@ class BoolFlag : public AbstractFlag {
 class Int32Flag : public AbstractFlag {
  public:
   int32_t getValue() { return value_; }
-  bool setValue(TokenIterator* it) override {
-    std::optional<std::string> token = it->next();
-    if (!token.has_value()) {
-      return false;
-    }
-    try {
-      value_ = std::stoi(*token);
-    } catch (...) {
-      return false;
-    }
-    return true;
+  bool setValue(std::stringstream& tokens) override {
+    tokens >> value_;
+    return !tokens.fail();
   }
 
  private:
@@ -62,13 +39,9 @@ class Int32Flag : public AbstractFlag {
 class StringFlag : public AbstractFlag {
  public:
   std::string getValue() { return value_; }
-  bool setValue(TokenIterator* it) override {
-    std::optional<std::string> token = it->next();
-    if (!token.has_value()) {
-      return false;
-    }
-    value_ = *token;
-    return true;
+  bool setValue(std::stringstream& tokens) override {
+    tokens >> value_;
+    return !tokens.fail();
   }
 
  private:
@@ -79,24 +52,25 @@ using FlagName = std::string;
 using FlagRegistry = std::unordered_map<FlagName, AbstractFlag*>;
 
 enum State { DONE, PARSE_ERROR, READ_FLAG };
-State read_flag(const FlagRegistry& registry, TokenIterator* it) {
-  std::optional<std::string> name_token = it->next();
-  if (!name_token.has_value()) {
+State read_flag(const FlagRegistry& registry, std::stringstream& tokens) {
+  std::string name_token;
+  tokens >> name_token;
+  if (tokens.fail()) {
     return DONE;
   }
-  if (name_token->size() <= 1) {
+  if (name_token.size() <= 1) {
     return PARSE_ERROR;
   }
-  if (name_token->at(0) != '-') {
+  if (name_token.at(0) != '-') {
     return PARSE_ERROR;
   }
-  std::string name = name_token->substr(1);
+  std::string name = name_token.substr(1);
   auto registry_it = registry.find(name);
   if (registry_it == registry.end()) {
     return PARSE_ERROR;
   }
   AbstractFlag* flag = registry_it->second;
-  bool success = flag->setValue(it);
+  bool success = flag->setValue(tokens);
   if (!success) {
     return PARSE_ERROR;
   }
@@ -104,11 +78,11 @@ State read_flag(const FlagRegistry& registry, TokenIterator* it) {
 }
 
 bool parse_arg_list(const FlagRegistry& registry, const std::string& arg_list) {
-  TokenIterator it(arg_list);
+  std::stringstream tokens(arg_list);
   State state = READ_FLAG;
 
   while (state == READ_FLAG) {
-    state = read_flag(registry, &it);
+    state = read_flag(registry, tokens);
   }
   return state == DONE;
 }
