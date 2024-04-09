@@ -6,25 +6,6 @@
 #include <unordered_map>
 #include <variant>
 
-enum FlagType { BOOL, INT32, STRING };
-using FlagName = std::string;
-using FlagSchema = std::unordered_map<FlagName, FlagType>;
-
-template <typename T>
-using FlagOfType = std::unordered_map<FlagName, T>;
-struct Flags {
-  Flags(const FlagSchema& schema) {
-    for (const auto& [name, type] : schema) {
-      if (type == BOOL) bool_flags[name] = false;
-      if (type == INT32) int32_flags[name] = 0;
-      if (type == STRING) string_flags[name] = "";
-    }
-  }
-  FlagOfType<bool> bool_flags;
-  FlagOfType<std::string> string_flags;
-  FlagOfType<int32_t> int32_flags;
-};
-
 class TokenIterator {
  public:
   TokenIterator(const std::string& arg_list) : token_stream(arg_list) {}
@@ -40,19 +21,62 @@ class TokenIterator {
   std::stringstream token_stream;
 };
 
-std::optional<bool> read_bool(TokenIterator*) { return true; }
-std::optional<int32_t> read_int32(TokenIterator* it) {
-  std::optional<std::string> token = it->next();
-  if (!token.has_value()) {
-    return std::nullopt;
+class AbstractFlag {
+ public:
+  virtual ~AbstractFlag() = default;
+  virtual bool setValue(TokenIterator*) = 0;
+};
+
+class BoolFlag : public AbstractFlag {
+ public:
+  bool getValue() { return value_; }
+  bool setValue(TokenIterator* it) override {
+    value_ = true;
+    return true;
   }
-  try {
-    return std::stoi(*token);
-  } catch (...) {
-    return std::nullopt;
+
+ private:
+  bool value_ = false;
+};
+
+class Int32Flag : public AbstractFlag {
+ public:
+  int32_t getValue() { return value_; }
+  bool setValue(TokenIterator* it) override {
+    std::optional<std::string> token = it->next();
+    if (!token.has_value()) {
+      return false;
+    }
+    try {
+      value_ = std::stoi(*token);
+    } catch (...) {
+      return false;
+    }
+    return true;
   }
-}
-std::optional<std::string> read_string(TokenIterator* it) { return it->next(); }
+
+ private:
+  int32_t value_ = 0;
+};
+
+class StringFlag : public AbstractFlag {
+ public:
+  std::string getValue() { return value_; }
+  bool setValue(TokenIterator* it) override {
+    std::optional<std::string> token = it->next();
+    if (!token.has_value()) {
+      return false;
+    }
+    value_ = *token;
+    return true;
+  }
+
+ private:
+  std::string value_ = "";
+};
+
+using FlagName = std::string;
+using FlagRegistry = std::unordered_map<FlagName, AbstractFlag*>;
 
 struct ParseError {};
 struct ReadName {};
@@ -63,8 +87,8 @@ struct Done {};
 using State = std::variant<ParseError, ReadName, ReadValue, Done>;
 class StateMachine {
  public:
-  StateMachine(const FlagSchema& schema, TokenIterator* it, Flags* flags)
-      : schema_(schema), it_(it), flags_(flags) {}
+  StateMachine(const FlagRegistry& registry, TokenIterator* it)
+      : registry_(registry), it_(it) {}
   State operator()(const ReadName&) {
     std::optional<std::string> name = it_->next();
     if (!name.has_value()) {
@@ -79,29 +103,14 @@ class StateMachine {
     return ReadValue{.flag_name = name->substr(1)};
   }
   State operator()(const ReadValue& state) {
-    auto schema_it = schema_.find(state.flag_name);
-    if (schema_it == schema_.end()) {
+    auto registry_it = registry_.find(state.flag_name);
+    if (registry_it == registry_.end()) {
       return ParseError{};
     }
-    FlagType type = schema_it->second;
-    if (type == BOOL) {
-      std::optional<bool> value = read_bool(it_);
-      if (!value.has_value()) {
-        return ParseError{};
-      }
-      flags_->bool_flags[state.flag_name] = *value;
-    } else if (type == INT32) {
-      std::optional<int32_t> value = read_int32(it_);
-      if (!value.has_value()) {
-        return ParseError{};
-      }
-      flags_->int32_flags[state.flag_name] = *value;
-    } else if (type == STRING) {
-      std::optional<std::string> value = read_string(it_);
-      if (!value.has_value()) {
-        return ParseError{};
-      }
-      flags_->string_flags[state.flag_name] = *value;
+    AbstractFlag* flag = registry_it->second;
+    bool success = flag->setValue(it_);
+    if (!success) {
+      return ParseError{};
     }
     return ReadName{};
   }
@@ -109,16 +118,13 @@ class StateMachine {
   State operator()(const Done& done) { return done; }
 
  private:
-  const FlagSchema& schema_;
+  const FlagRegistry& registry_;
   TokenIterator* it_;
-  Flags* flags_;
 };
 
-std::optional<Flags> parse_arg_list(const FlagSchema& schema,
-                                    const std::string& arg_list) {
+bool parse_arg_list(const FlagRegistry& registry, const std::string& arg_list) {
   TokenIterator it(arg_list);
-  Flags flags(schema);
-  StateMachine machine(schema, &it, &flags);
+  StateMachine machine(registry, &it);
   State state = ReadName{};
 
   while (!std::holds_alternative<Done>(state) &&
@@ -126,65 +132,110 @@ std::optional<Flags> parse_arg_list(const FlagSchema& schema,
     state = std::visit(machine, state);
   }
   if (std::holds_alternative<ParseError>(state)) {
-    return std::nullopt;
+    return false;
   }
-  return flags;
+  return true;
 }
 
-FlagSchema schema{{"l", BOOL}, {"p", INT32}, {"d", STRING}};
-
 void test_happy() {
+  BoolFlag local;
+  Int32Flag port;
+  StringFlag directory;
+  FlagRegistry registry;
+  registry["l"] = &local;
+  registry["p"] = &port;
+  registry["d"] = &directory;
   std::string arg_list = "-l -p 1080 -d /hola/mundo";
-  std::optional<Flags> flags = parse_arg_list(schema, arg_list);
-  assert(flags->bool_flags["l"] == true);
-  assert(flags->int32_flags["p"] == 1080);
-  assert(flags->string_flags["d"] == "/hola/mundo");
+
+  bool success = parse_arg_list(registry, arg_list);
+
+  assert(success);
+  assert(local.getValue() == true);
+  assert(port.getValue() == 1080);
+  assert(directory.getValue() == "/hola/mundo");
 }
 
 void test_not_in_arg_list() {
+  BoolFlag local;
+  Int32Flag port;
+  StringFlag directory;
+  FlagRegistry registry;
+  registry["l"] = &local;
+  registry["p"] = &port;
+  registry["d"] = &directory;
   std::string arg_list = "";
-  std::optional<Flags> flags = parse_arg_list(schema, arg_list);
-  assert(flags->bool_flags["l"] == false);
-  assert(flags->int32_flags["p"] == 0);
-  assert(flags->string_flags["d"] == "");
+
+  bool success = parse_arg_list(registry, arg_list);
+
+  assert(success);
+  assert(local.getValue() == false);
+  assert(port.getValue() == 0);
+  assert(directory.getValue() == "");
 }
 
 void test_not_in_scheme() {
+  FlagRegistry registry;
   std::string arg_list = "-x";
-  std::optional<Flags> flags = parse_arg_list(schema, arg_list);
-  assert(!flags.has_value());
+
+  bool success = parse_arg_list(registry, arg_list);
+
+  assert(!success);
 }
 
-void test_ambiguous_hyphen() {
+void test_value_starts_with_hyphen() {
+  Int32Flag port;
+  StringFlag directory;
+  FlagRegistry registry;
+  registry["p"] = &port;
+  registry["d"] = &directory;
   std::string arg_list = "-p -1080 -d -hola_mundo";
-  std::optional<Flags> flags = parse_arg_list(schema, arg_list);
-  assert(flags->int32_flags["p"] == -1080);
-  assert(flags->string_flags["d"] == "-hola_mundo");
+
+  bool success = parse_arg_list(registry, arg_list);
+
+  assert(success);
+  assert(port.getValue() == -1080);
+  assert(directory.getValue() == "-hola_mundo");
 }
 
 void test_early_exit() {
+  StringFlag directory;
+  FlagRegistry registry;
+  registry["d"] = &directory;
   std::string arg_list = "-d";
-  std::optional<Flags> flags = parse_arg_list(schema, arg_list);
-  assert(!flags.has_value());
+
+  bool success = parse_arg_list(registry, arg_list);
+
+  assert(!success);
 }
 
 void test_bad_int() {
+  Int32Flag port;
+  FlagRegistry registry;
+  registry["p"] = &port;
   std::string arg_list = "-p abc";
-  std::optional<Flags> flags = parse_arg_list(schema, arg_list);
-  assert(!flags.has_value());
+
+  bool success = parse_arg_list(registry, arg_list);
+
+  assert(!success);
 }
 
 void test_duplicate() {
+  Int32Flag port;
+  FlagRegistry registry;
+  registry["p"] = &port;
   std::string arg_list = "-p 1080 -p 88";
-  std::optional<Flags> flags = parse_arg_list(schema, arg_list);
-  assert(flags->int32_flags["p"] == 88);
+
+  bool success = parse_arg_list(registry, arg_list);
+
+  assert(success);
+  assert(port.getValue() == 88);
 }
 
 int main() {
   test_happy();
   test_not_in_arg_list();
   test_not_in_scheme();
-  test_ambiguous_hyphen();
+  test_value_starts_with_hyphen();
   test_early_exit();
   test_bad_int();
   test_duplicate();
